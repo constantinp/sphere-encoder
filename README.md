@@ -103,6 +103,11 @@ To evaluate a trained model, for example, `./workspace/experiments/sphere-base-b
 
 The evaluation results will be saved in `./workspace/experiments/sphere-base-base-cifar-10-32px/eval/` with a table format.
 
+## Model Card
+
+For ease of comparison and reproducibility, please see the model card in [MODEL.md](MODEL.md). 
+It details our trained models, evaluation scripts, and the performance results reported in the paper.
+
 ## Image Generation
 
 ```bash
