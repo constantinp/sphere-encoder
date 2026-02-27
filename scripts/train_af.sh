@@ -13,6 +13,7 @@
   --epochs 1000 \
   --compression_ratio 1.5 \
   --noise_sigma_max_angle 85 \
+  --cond_generator False \
   --vit_enc_model_size base \
   --vit_dec_model_size base \
   --vit_enc_latent_mlp_mixer_depth 4 \
