@@ -253,8 +253,8 @@ class Attention(nn.Module):
         q, k, v = einops.rearrange(
             qkv, "b n (qkv h d) -> qkv b h n d", qkv=3, h=self.num_heads
         ).unbind(0)
-        q = apply_rotary_emb(q, rope)
-        k = apply_rotary_emb(k, rope)
+        q = apply_rotary_emb(q, rope).to(v.dtype)
+        k = apply_rotary_emb(k, rope).to(v.dtype)
         x = F.scaled_dot_product_attention(q, k, v)
         return self.proj(x.transpose(1, 2).reshape(bsz, n_ctx, ch))
 
