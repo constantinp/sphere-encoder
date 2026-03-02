@@ -135,7 +135,7 @@ parser.add_argument(
 )
 parser.add_argument("--device_type", type=str, default="cuda", choices=["cuda", "cpu"])
 parser.add_argument("--compile_model", type=str2bool, default=False)
-parser.add_argument("--force_to_bf16", type=str2bool, default=True)
+parser.add_argument("--force_to_bf16", type=str2bool, default=False)
 parser.add_argument("--use_activation_checkpointing", type=str2bool, default=False)
 # --- loss
 parser.add_argument(
