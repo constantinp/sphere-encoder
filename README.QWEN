@@ -8,7 +8,7 @@ The new path:
 - uses `Qwen/Qwen3.5-0.8B-Base`
 - extracts the final hidden state (`layer 24`)
 - applies attention-mask-aware mean pooling to get one conditioning vector per prompt
-- trains and samples without importing `aphrodite.*`
+- prepares, trains, and samples without importing `aphrodite.*`
 
 ## Requirements
 
@@ -48,7 +48,7 @@ Each sidecar should be a JSON object with any of:
 
 ## 1. Prepare The Dataset
 
-This scans recursively for images that have usable `_cap.json` sidecars and writes:
+This runs the Sphere-local script `prepare_dataset.py`, scans recursively for images that have usable `_cap.json` sidecars, and writes:
 
 - `workspace/datasets/list/train.json`
 - `workspace/datasets/list/val.json`
@@ -159,6 +159,7 @@ PROMPT="portrait photo of a woman, soft natural light, detailed skin, 35mm" \
 ## Files Added For This Mode
 
 - `sphere/text.py`
+- `prepare_dataset.py`
 - `scripts/prepare_text_dataset.sh`
 - `scripts/train_text_qwen.sh`
 - `scripts/sample_text_qwen.sh`
