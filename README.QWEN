@@ -1,0 +1,165 @@
+# Qwen Embedding Mode
+
+This document describes the self-contained Qwen-conditioned workflow added under `tmp/sphere-encoder`.
+
+The new path:
+
+- reads Aphrodite-style caption sidecars: `{image.ext}_cap.json`
+- uses `Qwen/Qwen3.5-0.8B-Base`
+- extracts the final hidden state (`layer 24`)
+- applies attention-mask-aware mean pooling to get one conditioning vector per prompt
+- trains and samples without importing `aphrodite.*`
+
+## Requirements
+
+Install the local Sphere dependencies, including `transformers`:
+
+```bash
+pip install --no-cache-dir torch torchvision fvcore numpy tqdm wandb transformers git+https://github.com/LTH14/torch-fidelity.git
+```
+
+Run all commands from:
+
+```bash
+cd tmp/sphere-encoder
+```
+
+## Dataset Contract
+
+Your source dataset should contain images plus caption sidecars:
+
+```text
+some_dataset/
+  image_0001.jpg
+  image_0001.jpg_cap.json
+  image_0002.png
+  image_0002.png_cap.json
+```
+
+Each sidecar should be a JSON object with any of:
+
+```json
+{
+  "verbose": "a detailed caption",
+  "brief": "a short caption",
+  "tags": "tag1, tag2, tag3"
+}
+```
+
+## 1. Prepare The Dataset
+
+This scans recursively for images that have usable `_cap.json` sidecars and writes:
+
+- `workspace/datasets/list/train.json`
+- `workspace/datasets/list/val.json`
+
+Default example:
+
+```bash
+IMG_DIR=/absolute/path/to/your/captioned/images \
+./scripts/prepare_text_dataset.sh
+```
+
+Optional overrides:
+
+```bash
+IMG_DIR=/absolute/path/to/your/captioned/images \
+OUTPUT_DIR=workspace/datasets/list \
+VAL_SPLIT=0.05 \
+SEED=123 \
+./scripts/prepare_text_dataset.sh
+```
+
+## 2. Train
+
+Default training example:
+
+```bash
+./scripts/train_text_qwen.sh
+```
+
+That wrapper runs embedding-conditioned training with:
+
+- `--dataset_name list`
+- `--conditioning_mode embedding`
+- `--text_encoder_model Qwen/Qwen3.5-0.8B-Base`
+- `--text_encoder_extraction_layers 24`
+
+Common overrides:
+
+```bash
+DEV_DIR=workspace \
+DATA_DIR=datasets \
+DATASET_NAME=list \
+IMAGE_SIZE=256 \
+EPOCHS=800 \
+WARMUP_EPOCHS=5 \
+BATCH_SIZE_PER_RANK=16 \
+BATCH_SIZE=256 \
+TEXT_ENCODER_MODEL=Qwen/Qwen3.5-0.8B-Base \
+./scripts/train_text_qwen.sh
+```
+
+If your manifest was written somewhere else, point `DEV_DIR` and `DATA_DIR` at the folder structure expected by `train.py`. For example, if the manifest is at:
+
+```text
+workspace/datasets/my_text_set/train.json
+```
+
+then use:
+
+```bash
+DATA_DIR=datasets \
+DATASET_NAME=my_text_set \
+./scripts/train_text_qwen.sh
+```
+
+## 3. Sample From Prompts
+
+Sampling requires the experiment directory name under `workspace/experiments`.
+
+Single-prompt example:
+
+```bash
+JOB_DIR=sphere-base-base-list-embedding-256px \
+PROMPT="portrait photo of a woman, soft natural light, detailed skin, 35mm" \
+./scripts/sample_text_qwen.sh
+```
+
+Prompt-file example:
+
+```bash
+JOB_DIR=sphere-base-base-list-embedding-256px \
+PROMPTS_FILE=/absolute/path/to/prompts.txt \
+NUM_GEN_SAMPLES=16 \
+./scripts/sample_text_qwen.sh
+```
+
+Notes:
+
+- `NUM_GEN_SAMPLES` should be divisible by `world_size * batch_size_per_rank`.
+- If you pass fewer prompts than `NUM_GEN_SAMPLES`, `sample.py` repeats prompts to fill the requested sample count.
+- In embedding mode, `sample.py` reconstructs the Qwen config from the saved training config in the experiment directory.
+
+## End-To-End Example
+
+```bash
+cd tmp/sphere-encoder
+
+IMG_DIR=/absolute/path/to/your/captioned/images \
+./scripts/prepare_text_dataset.sh
+
+./scripts/train_text_qwen.sh
+
+JOB_DIR=sphere-base-base-list-embedding-256px \
+PROMPT="portrait photo of a woman, soft natural light, detailed skin, 35mm" \
+./scripts/sample_text_qwen.sh
+```
+
+## Files Added For This Mode
+
+- `sphere/text.py`
+- `scripts/prepare_text_dataset.sh`
+- `scripts/train_text_qwen.sh`
+- `scripts/sample_text_qwen.sh`
+- `README.QWEN`

@@ -14,7 +14,7 @@ This repository contains the PyTorch code for reproducing the results in the pap
 ## Install 
 
 ```bash
-pip install --no-cache-dir torch torchvision fvcore numpy tqdm wandb git+https://github.com/LTH14/torch-fidelity.git
+pip install --no-cache-dir torch torchvision fvcore numpy tqdm wandb transformers git+https://github.com/LTH14/torch-fidelity.git
 ```
 
 ## Training

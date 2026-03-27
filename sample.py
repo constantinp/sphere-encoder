@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 import sphere.rng as rng
 from sphere.model import G
+from sphere.text import QwenTextEmbedder
 from sphere.ema import SimpleEMA
 from sphere.utils import (
     load_ckpt,
@@ -44,6 +45,8 @@ parser.add_argument("--ckpt_fname", type=str, default=None)
 parser.add_argument("--num_gen_samples", type=int, default=64)
 parser.add_argument("--batch_size_per_rank", type=int, default=16)
 parser.add_argument("--class_of_interests", type=int, nargs="+", default=[100])
+parser.add_argument("--prompt", action="append", default=None)
+parser.add_argument("--prompts_file", type=str, default=None)
 parser.add_argument("--num_trials", type=int, default=2)
 parser.add_argument("--compile_model", type=str2bool, default=True)
 parser.add_argument("--random_sample_classes", type=str2bool, default=False)
@@ -65,6 +68,35 @@ cli_args = parser.parse_args()
 # -----------------------------------------------------------------------------
 
 
+def build_text_embedder(args, device, ptdtype):
+    return QwenTextEmbedder(
+        model_name=args.text_encoder_model,
+        extraction_layers=args.text_encoder_extraction_layers,
+        max_length=args.text_encoder_max_length,
+        dtype=ptdtype,
+        device=device,
+    )
+
+
+def load_prompts(args):
+    prompts = []
+    if args.prompt:
+        prompts.extend(args.prompt)
+    if args.prompts_file is not None:
+        with open(args.prompts_file, "r", encoding="utf-8") as f:
+            prompts.extend([line.strip() for line in f if line.strip()])
+    if not prompts:
+        raise ValueError("embedding-mode sampling requires --prompt or --prompts_file")
+    return prompts
+
+
+def expand_prompts(prompts, total):
+    if len(prompts) >= total:
+        return prompts[:total]
+    reps = (total + len(prompts) - 1) // len(prompts)
+    return (prompts * reps)[:total]
+
+
 def main(cli_args):
     # setup dirs
     exp_dir = osp.join(cli_args.dev_dir, "experiments", cli_args.job_dir)
@@ -83,6 +115,16 @@ def main(cli_args):
 
     # convert to namespace for easy access
     args = SimpleNamespace(**cfg_args)
+    if not hasattr(args, "conditioning_mode"):
+        args.conditioning_mode = "class"
+    if not hasattr(args, "text_encoder_model"):
+        args.text_encoder_model = "Qwen/Qwen3.5-0.8B-Base"
+    if not hasattr(args, "text_encoder_extraction_layers"):
+        args.text_encoder_extraction_layers = [24]
+    if not hasattr(args, "text_encoder_max_length"):
+        args.text_encoder_max_length = 512
+    if not hasattr(args, "cond_dim"):
+        args.cond_dim = 0
     for k, v in args.__dict__.items():
         logger.info(f"{k}: {v}")
 
@@ -119,16 +161,21 @@ def main(cli_args):
     os.makedirs(out_dir, exist_ok=True)
     logger.info(f"create output folder: {out_dir}")
 
-    if args.dataset_name in ["cifar-10", "flowers-102", "animal-faces"]:
+    if args.conditioning_mode == "class" and args.dataset_name in ["cifar-10", "flowers-102", "animal-faces"]:
         args.random_sample_classes = True
         logger.info(f"enable random sampling classes for {args.dataset_name}")
 
-    if args.random_sample_classes:
+    if args.conditioning_mode == "class" and args.random_sample_classes:
         args.class_of_interests = [0]  # dummy for one loop
 
-    if args.dataset_name in ["flowers-102"]:
+    if args.conditioning_mode == "class" and args.dataset_name in ["flowers-102"]:
         args.cache_sampling_noise = False
         logger.info(f"disable caching sampling noise for {args.dataset_name}")
+
+    text_embedder = None
+    if args.conditioning_mode == "embedding":
+        text_embedder = build_text_embedder(args, device=device, ptdtype=ptdtype)
+        args.cond_dim = text_embedder.output_dim
 
     # build model
     model = G(
@@ -138,6 +185,7 @@ def main(cli_args):
         vit_dec_model_size=args.vit_dec_model_size,
         token_channels=args.token_channels,
         num_classes=args.num_classes if args.cond_generator else 0,
+        cond_dim=args.cond_dim,
         halve_model_size=args.halve_model_size,
         spherify_model=args.spherify_model,
         pixel_head_type=args.pixel_head_type,
@@ -196,6 +244,97 @@ def main(cli_args):
     cfg_vals = [
         round(v, 1) for v in list(np.arange(args.cfg_min, args.cfg_max, args.cfg_gap))
     ] + [args.cfg_max]
+
+    if args.conditioning_mode == "embedding":
+        prompts = expand_prompts(load_prompts(args), args.num_gen_samples)
+        prompts_per_rank = args.num_gen_samples // ddp_world_size
+        rank_start = ddp_rank * prompts_per_rank
+        rank_prompts = prompts[rank_start : rank_start + prompts_per_rank]
+        assert len(rank_prompts) % args.batch_size_per_rank == 0
+        num_batches_per_rank = len(rank_prompts) // args.batch_size_per_rank
+
+        for try_id in range(args.num_trials):
+            for cfg in cfg_vals:
+                for fwd_step in args.forward_steps:
+                    save_name = (
+                        f"imgs"
+                        f"_try={try_id:02d}"
+                        f"_pth={ckpt_epoch}"
+                        f"_cfg={cfg}-{args.cfg_position}"
+                        f"_steps={fwd_step}"
+                        f"_sched={args.use_sampling_scheduler}"
+                        f"_cache={args.cache_sampling_noise}"
+                        f"_prompted"
+                    )
+                    if not args.save_grid_images:
+                        sub_dir = osp.join(out_dir, save_name)
+                        if osp.exists(sub_dir):
+                            shutil.rmtree(sub_dir)
+                        os.makedirs(sub_dir, exist_ok=True)
+                    else:
+                        save_path = osp.join(out_dir, save_name + ".png")
+                        gen_images = []
+
+                    dist.barrier()
+                    logger.info("start sampling prompt-conditioned images")
+
+                    pbar = tqdm(range(num_batches_per_rank), total=num_batches_per_rank)
+                    for batch_idx in pbar:
+                        start = batch_idx * args.batch_size_per_rank
+                        end = start + args.batch_size_per_rank
+                        batch_prompts = rank_prompts[start:end]
+
+                        with (
+                            torch.random.fork_rng(devices=[device])
+                            if args.seed_sampling
+                            else nullcontext()
+                        ):
+                            if args.seed_sampling:
+                                torch.manual_seed(rng.fold_in(seed, ddp_rank, batch_idx))
+
+                            cond_embed = text_embedder.encode_pooled(batch_prompts)
+                            cond_embed_uncond = (
+                                text_embedder.encode_pooled([""] * len(batch_prompts))
+                                if cfg > 1.0
+                                else None
+                            )
+
+                            with torch.autocast(device_type="cuda", dtype=ptdtype):
+                                x_gen_1_step, x_gen_n_step = model.generate(
+                                    batch_size=len(batch_prompts),
+                                    cond_embed=cond_embed,
+                                    cond_embed_uncond=cond_embed_uncond,
+                                    cfg=cfg,
+                                    cfg_position=args.cfg_position,
+                                    forward_steps=fwd_step,
+                                    use_sampling_scheduler=args.use_sampling_scheduler,
+                                    cache_sampling_noise=args.cache_sampling_noise,
+                                    device=device,
+                                )
+
+                        if args.save_grid_images:
+                            gen_images.append(x_gen_n_step)
+                        else:
+                            save_image(
+                                x=x_gen_n_step,
+                                batch_idx=batch_idx,
+                                ddp_rank=ddp_rank,
+                                save_dir=sub_dir,
+                            )
+
+                    dist.barrier()
+                    if args.save_grid_images:
+                        gen_images = torch.cat(gen_images, dim=0)
+                        gen_images = nn_concat_all_gather(gen_images)
+                        save_tensors_to_images(
+                            gen_images,
+                            path=save_path,
+                            nrow=args.grid_nrow,
+                            max_nimgs=args.num_gen_samples,
+                        )
+
+        dist.destroy_process_group()
+        return
 
     # stack loops
     for try_id in range(args.num_trials):

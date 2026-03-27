@@ -22,6 +22,38 @@ from torchvision import transforms
 from torchvision.datasets.folder import default_loader
 
 logger = logging.getLogger(__name__)
+CAPTION_STYLES = ("verbose", "brief", "tags")
+
+
+def caption_sidecar_path(image_path):
+    return image_path + "_cap.json"
+
+
+def load_caption_sidecar(image_path):
+    sidecar_path = caption_sidecar_path(image_path)
+    if not os.path.exists(sidecar_path):
+        raise FileNotFoundError(f"caption sidecar not found: {sidecar_path}")
+    with open(sidecar_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"caption sidecar must contain a JSON object: {sidecar_path}")
+    captions = {key: value for key, value in payload.items() if isinstance(value, str) and value.strip()}
+    if not captions:
+        raise ValueError(f"caption sidecar does not contain any usable captions: {sidecar_path}")
+    return captions
+
+
+def select_caption(captions, caption_style=None):
+    if caption_style is not None:
+        if caption_style not in captions or not captions[caption_style].strip():
+            raise ValueError(f"caption_style='{caption_style}' not found in caption sidecar")
+        return captions[caption_style]
+
+    available_styles = [style for style in CAPTION_STYLES if captions.get(style)]
+    if available_styles:
+        return captions[random.choice(available_styles)]
+
+    return random.choice(list(captions.values()))
 
 
 class ListDataset(Dataset):
@@ -32,11 +64,15 @@ class ListDataset(Dataset):
         transform=None,
         max_samples=-1,
         load_from_zip=False,
+        conditioning_mode="class",
+        caption_style=None,
         **kwargs,
     ):
         self.root = root
         self.split = split
         self.transform = transform
+        self.conditioning_mode = conditioning_mode
+        self.caption_style = caption_style
 
         json_path = os.path.join(root, f"{split}.json")
 
@@ -50,9 +86,14 @@ class ListDataset(Dataset):
             data = [json.loads(line.strip()) for line in f]
 
         assert len(data) > 0
-        assert "class_id" in data[0]
-        assert "class_name" in data[0]
         assert "image_path" in data[0]
+        if self.conditioning_mode == "class":
+            assert "class_id" in data[0]
+            assert "class_name" in data[0]
+        elif self.conditioning_mode != "embedding":
+            raise ValueError(
+                f"conditioning_mode must be 'class' or 'embedding', got {self.conditioning_mode}"
+            )
 
         self.list = data
 
@@ -60,14 +101,19 @@ class ListDataset(Dataset):
             self.list = sample_subset(data, max_samples)
 
         self.load_from_zip = load_from_zip
+        if self.conditioning_mode == "embedding" and self.load_from_zip:
+            raise ValueError("embedding conditioning does not support load_from_zip")
         self.archive = None
 
     def __getitem__(self, index):
         item = self.list[index]
 
         image_path = str(item["image_path"])
-        class_id = int(item["class_id"])
-        class_name = str(item["class_name"])
+        class_id = None
+        class_name = None
+        if self.conditioning_mode == "class":
+            class_id = int(item["class_id"])
+            class_name = str(item["class_name"])
 
         is_absolute_path = False
         if "is_absolute_path" in item:
@@ -94,6 +140,11 @@ class ListDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
+        if self.conditioning_mode == "embedding":
+            captions = load_caption_sidecar(absolute_image_path)
+            caption = select_caption(captions, caption_style=self.caption_style)
+            return img, caption, absolute_image_path
+
         return img, class_id, class_name
 
     def __len__(self):
@@ -108,6 +159,12 @@ class ListDataset(Dataset):
 
 
 def sample_subset(data: list, max_samples: int):
+    if "class_id" not in data[0]:
+        random.shuffle(data)
+        _list = data[:max_samples]
+        logger.info(f"random sampling partial data: {len(_list)}")
+        return _list
+
     cnt_per_class = defaultdict(int)
 
     # get total number of classes
@@ -195,6 +252,8 @@ def create_loader(
     num_workers=1,
     train_only=False,
     load_from_zip=False,
+    conditioning_mode="class",
+    caption_style=None,
 ):
     assert crop_mode in ["random", "center", "random_adm", "center_adm"]
 
@@ -267,6 +326,8 @@ def create_loader(
         ),
         max_samples=max_samples,
         load_from_zip=load_from_zip,
+        conditioning_mode=conditioning_mode,
+        caption_style=caption_style,
     )
     logger.info(f"number of samples in train dataset: {len(train_dataset)}")
     train_sampler = torch.utils.data.DistributedSampler(
@@ -295,6 +356,8 @@ def create_loader(
         root=dataset_dir,
         split="test",
         download=True,
+        conditioning_mode=conditioning_mode,
+        caption_style=caption_style,
         transform=transforms.Compose(
             [
                 partial(center_crop_arr, image_size=image_size),
@@ -323,6 +386,8 @@ def create_loader(
             root=dataset_dir,
             split="train",
             download=True,
+            conditioning_mode=conditioning_mode,
+            caption_style=caption_style,
             transform=transforms.Compose(
                 [
                     partial(center_crop_arr, image_size=image_size),

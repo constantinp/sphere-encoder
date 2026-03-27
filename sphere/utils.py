@@ -139,6 +139,8 @@ def visualize(
     device="cuda",
     ctx=nullcontext(),
     fsdp_mode=False,
+    conditioning_mode="class",
+    text_embedder=None,
 ):
     assert save_dir is not None
 
@@ -158,63 +160,110 @@ def visualize(
         logger.info("no ema_model to use")
         use_ema_model = False
 
-    imgs, clss = next(vis_loader)[:2]
+    imgs, cond_input = next(vis_loader)[:2]
     N = 1 if gather_all_tensors else len(imgs)
 
     imgs = imgs[:N].to(device, non_blocking=True)
-    clss = clss[:N].to(device, non_blocking=True)
+    clss = None
+    cond_embed = None
+    cond_embed_uncond = None
+    gen_clss = None
 
-    if class_of_interest is not None:
-        gen_clss = np.random.choice(class_of_interest, size=N)
-        gen_clss = torch.tensor(gen_clss, dtype=torch.long, device=device)
+    if conditioning_mode == "embedding":
+        if text_embedder is None:
+            raise ValueError("text_embedder is required for embedding-mode visualization")
+        prompts = list(cond_input[:N])
+        cond_embed = text_embedder.encode_pooled(prompts)
+        if cfg > 1.0:
+            cond_embed_uncond = text_embedder.encode_pooled([""] * N)
     else:
-        gen_clss = clss
+        clss = cond_input[:N].to(device, non_blocking=True)
+        if class_of_interest is not None:
+            gen_clss = np.random.choice(class_of_interest, size=N)
+            gen_clss = torch.tensor(gen_clss, dtype=torch.long, device=device)
+        else:
+            gen_clss = clss
 
     with fsdp_ctx, ctx:
         # reconstruction
-        rec_imgs = model_without_ddp.reconstruct(imgs, clss, sampling=False)
+        rec_imgs = model_without_ddp.reconstruct(
+            imgs,
+            clss,
+            sampling=False,
+            cond_embed=cond_embed,
+        )
         rec_imgs_with_noise_small = model_without_ddp.reconstruct(
-            imgs, clss, noise_scaler=0.5, sampling=True
+            imgs,
+            clss,
+            noise_scaler=0.5,
+            sampling=True,
+            cond_embed=cond_embed,
         )
         rec_imgs_with_noise_large = model_without_ddp.reconstruct(
-            imgs, clss, noise_scaler=1.0, sampling=True
+            imgs,
+            clss,
+            noise_scaler=1.0,
+            sampling=True,
+            cond_embed=cond_embed,
         )
 
-        # generation
-        gen_rand_1_step, gen_rand_n_step = model_without_ddp.generate(
-            batch_size=N,
-            y=gen_clss if model_without_ddp.use_modulation else None,
-            cfg=cfg,
-            cfg_position=cfg_position,
-            forward_steps=forward_steps,
-            use_sampling_scheduler=use_sampling_scheduler,
-            device=device,
-        )
+        if conditioning_mode == "embedding":
+            gen_1_step, gen_n_step = model_without_ddp.generate(
+                batch_size=N,
+                cond_embed=cond_embed,
+                cond_embed_uncond=cond_embed_uncond,
+                cfg=cfg,
+                cfg_position=cfg_position,
+                forward_steps=forward_steps,
+                use_sampling_scheduler=use_sampling_scheduler,
+                device=device,
+            )
+        else:
+            gen_rand_1_step, gen_rand_n_step = model_without_ddp.generate(
+                batch_size=N,
+                y=gen_clss if model_without_ddp.use_modulation else None,
+                cfg=cfg,
+                cfg_position=cfg_position,
+                forward_steps=forward_steps,
+                use_sampling_scheduler=use_sampling_scheduler,
+                device=device,
+            )
 
-        gen_clss_1_step, gen_clss_n_step = model_without_ddp.generate(
-            batch_size=N,
-            y=gen_clss if model_without_ddp.use_modulation else None,
-            cfg=cfg,
-            cfg_position=cfg_position,
-            forward_steps=forward_steps,
-            use_sampling_scheduler=use_sampling_scheduler,
-            device=device,
-        )
+            gen_clss_1_step, gen_clss_n_step = model_without_ddp.generate(
+                batch_size=N,
+                y=gen_clss if model_without_ddp.use_modulation else None,
+                cfg=cfg,
+                cfg_position=cfg_position,
+                forward_steps=forward_steps,
+                use_sampling_scheduler=use_sampling_scheduler,
+                device=device,
+            )
 
     ori_imgs = imgs * 0.5 + 0.5
 
-    to_zip = [
-        ori_imgs,
-        rec_imgs,
-        rec_imgs_with_noise_small,
-        rec_imgs_with_noise_large,
-        gen_rand_1_step,
-        gen_clss_1_step,
-    ]
-    if forward_steps > 1:
-        to_zip.append(gen_rand_n_step)
-        to_zip[-1], to_zip[-2] = to_zip[-2], to_zip[-1]
-        to_zip.append(gen_clss_n_step)
+    if conditioning_mode == "embedding":
+        to_zip = [
+            ori_imgs,
+            rec_imgs,
+            rec_imgs_with_noise_small,
+            rec_imgs_with_noise_large,
+            gen_1_step,
+        ]
+        if forward_steps > 1:
+            to_zip.append(gen_n_step)
+    else:
+        to_zip = [
+            ori_imgs,
+            rec_imgs,
+            rec_imgs_with_noise_small,
+            rec_imgs_with_noise_large,
+            gen_rand_1_step,
+            gen_clss_1_step,
+        ]
+        if forward_steps > 1:
+            to_zip.append(gen_rand_n_step)
+            to_zip[-1], to_zip[-2] = to_zip[-2], to_zip[-1]
+            to_zip.append(gen_clss_n_step)
 
     if ddp_rank == 0:
         img_path = (

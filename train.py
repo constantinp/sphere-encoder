@@ -24,6 +24,7 @@ from sphere.loader import create_loader, ListDataset
 from sphere.logger import append_log, setup_logging
 from sphere.loss import ReconstructionLoss
 from sphere.model import G
+from sphere.text import QwenTextEmbedder
 from sphere.utils import cosine_scheduler, load_ckpt, save_ckpt, visualize
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
@@ -70,7 +71,14 @@ parser.add_argument(
         "flowers-102",
         "animal-faces",
         "imagenet",
+        "list",
     ],
+)
+parser.add_argument(
+    "--conditioning_mode",
+    type=str,
+    default="class",
+    choices=["class", "embedding"],
 )
 parser.add_argument("--image_size", type=int, default=256)
 parser.add_argument("--num_workers", type=int, default=12)
@@ -91,6 +99,19 @@ parser.add_argument("--load_from_zip", type=str2bool, default=False)
 parser.add_argument(
     "--max_samples", type=int, default=-1, help="for using partial data"
 )
+parser.add_argument("--caption_style", type=str, default=None)
+parser.add_argument(
+    "--text_encoder_model",
+    type=str,
+    default="Qwen/Qwen3.5-0.8B-Base",
+)
+parser.add_argument(
+    "--text_encoder_extraction_layers",
+    type=int,
+    nargs="+",
+    default=[24],
+)
+parser.add_argument("--text_encoder_max_length", type=int, default=512)
 # --- optimizer
 parser.add_argument("--batch_size", type=int, default=256)
 parser.add_argument("--batch_size_per_rank", type=int, default=16)
@@ -171,10 +192,21 @@ def set_exp_name(args):
     exp_name += f"-{args.vit_enc_model_size}"
     exp_name += f"-{args.vit_dec_model_size}"
     exp_name += f"-{args.dataset_name}"
+    exp_name += f"-{args.conditioning_mode}"
     exp_name += f"-{args.image_size}px"
     if args.use_wandb:
         exp_name += f"-{os.urandom(6).hex()[:6]}"
     return exp_name
+
+
+def build_text_embedder(args, device, ptdtype):
+    return QwenTextEmbedder(
+        model_name=args.text_encoder_model,
+        extraction_layers=args.text_encoder_extraction_layers,
+        max_length=args.text_encoder_max_length,
+        dtype=ptdtype,
+        device=device,
+    )
 
 
 def main(args):
@@ -224,16 +256,6 @@ def main(args):
         os.makedirs(d, exist_ok=True)
     dist.barrier()
 
-    # logger
-    if args.use_wandb and ddp_rank0:
-        wandb.login(key=args.wandb_key, host="https://api.wandb.ai", relogin=True)
-        wandb.init(
-            name=job_dir,
-            project=args.wandb_project,
-            config=vars(args),
-            entity=args.wandb_entity,
-        )
-
     setup_logging(output_path=exp_dir, rank=ddp_rank)
     logger.info(f"logging to {exp_dir}")
 
@@ -241,16 +263,21 @@ def main(args):
     log_training_path = os.path.join(exp_dir, "log.jsonl")
 
     # prepare various components before training starts
-    args.num_classes = {
-        "food-101": 101,
-        "flowers-102": 102,
-        "animal-faces": 3,
-        "cifar-10": 10,
-        "cifar-100": 100,
-        "imagenet": 1000,
-    }[args.dataset_name]
+    if args.conditioning_mode == "embedding":
+        args.num_classes = 0
+        args.cond_generator = False
+        args.class_of_interest = None
+    else:
+        args.num_classes = {
+            "food-101": 101,
+            "flowers-102": 102,
+            "animal-faces": 3,
+            "cifar-10": 10,
+            "cifar-100": 100,
+            "imagenet": 1000,
+        }[args.dataset_name]
 
-    if args.dataset_name == "imagenet":
+    if args.conditioning_mode == "class" and args.dataset_name == "imagenet":
         args.class_of_interest = [
             913,  # wreck
             283,  # persian cat
@@ -286,6 +313,9 @@ def main(args):
     else:
         # load images from a list of file paths and labels
         dataset_cls = ListDataset
+
+    if args.dataset_name == "list" and args.conditioning_mode == "class":
+        raise ValueError("dataset_name='list' currently supports conditioning_mode='embedding' only")
 
     if args.image_size <= 64:
         args.interp_mode = "nearest"
@@ -323,6 +353,28 @@ def main(args):
     # mix hard cases settings
     args.mix_hard_cases_max_angle = min(args.noise_sigma_max_angle + 5, 89)
 
+    text_embedder = None
+    args.cond_dim = 0
+    if args.conditioning_mode == "embedding":
+        text_embedder = build_text_embedder(args, device=device, ptdtype=ptdtype)
+        args.cond_dim = text_embedder.output_dim
+        logger.info(
+            "embedding conditioning enabled with %s, layers=%s, cond_dim=%s",
+            args.text_encoder_model,
+            args.text_encoder_extraction_layers,
+            args.cond_dim,
+        )
+
+    # logger
+    if args.use_wandb and ddp_rank0:
+        wandb.login(key=args.wandb_key, host="https://api.wandb.ai", relogin=True)
+        wandb.init(
+            name=job_dir,
+            project=args.wandb_project,
+            config=vars(args),
+            entity=args.wandb_entity,
+        )
+
     # dump config
     config_path = os.path.join(exp_dir, "cfg.json")
     if ddp_rank0:
@@ -347,6 +399,8 @@ def main(args):
         batch_size_per_rank=args.batch_size_per_rank,
         num_workers=args.num_workers,
         load_from_zip=args.load_from_zip,
+        conditioning_mode=args.conditioning_mode,
+        caption_style=args.caption_style,
     )
     logger.info(f"training dataset: {train_loader.dataset}")
 
@@ -402,6 +456,7 @@ def main(args):
         vit_dec_model_size=args.vit_dec_model_size,
         token_channels=args.token_channels,
         num_classes=args.num_classes if args.cond_generator else 0,
+        cond_dim=args.cond_dim,
         halve_model_size=args.halve_model_size,
         in_context_size=args.in_context_size,
         pixel_head_type=args.pixel_head_type,
@@ -605,6 +660,8 @@ def main(args):
         save_dir=args.vis_dir,
         device=device,
         ctx=ctx,
+        conditioning_mode=args.conditioning_mode,
+        text_embedder=text_embedder,
     )
 
     # scheduler for lr
@@ -634,13 +691,22 @@ def main(args):
                 else:
                     pg["lr"] = lr
 
-            imgs, clss = data[:2]  # FIXME: ignore the rest
+            imgs, cond_input = data[:2]  # class ids or caption strings
             imgs = imgs.to(device, non_blocking=True)  # [-1, 1]
-            clss = clss.to(device, non_blocking=True)
+            clss = None
+            cond_embed = None
+            if args.conditioning_mode == "embedding":
+                cond_embed = text_embedder.encode_pooled(list(cond_input))
+            else:
+                clss = cond_input.to(device, non_blocking=True)
 
             # forward
             with ctx:
-                rec_imgs, extra_loss, z_noisy, z_clean = model(imgs, clss)
+                rec_imgs, extra_loss, z_noisy, z_clean = model(
+                    imgs,
+                    clss,
+                    cond_embed=cond_embed,
+                )
                 loss = loss_cls(
                     input=rec_imgs * 0.5 + 0.5,  # [0, 1]
                     target=imgs * 0.5 + 0.5,
@@ -723,6 +789,8 @@ def main(args):
                 save_dir=args.vis_dir,
                 device=device,
                 ctx=ctx,
+                conditioning_mode=args.conditioning_mode,
+                text_embedder=text_embedder,
             )
 
         if (epoch + 1) % args.ckpt_save_interval == 0:

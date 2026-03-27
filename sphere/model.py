@@ -48,6 +48,7 @@ class Transformer(nn.Module):
         model_type: str = "encoder",
         token_chns: int = 16,
         num_classes: int = 0,
+        use_modulation: bool | None = None,
         in_context_size: int = 0,
         pixel_head_type: str = "linear",
         latent_mlp_mixer_depth: int = 0,
@@ -127,7 +128,9 @@ class Transformer(nn.Module):
             if self.num_classes > 0
             else None
         )
-        self.use_modulation = self.y_embedder is not None
+        if use_modulation is None:
+            use_modulation = self.y_embedder is not None
+        self.use_modulation = use_modulation
 
         # in-context embed (can be used for unconditional generation)
         self.use_inctx = self.inctx_size > 0
@@ -367,6 +370,7 @@ class G(nn.Module):
         vit_dec_model_size: str = "base",
         token_channels: int = 16,
         num_classes: int = 0,
+        cond_dim: int = 0,
         in_context_size: int = 0,
         pixel_head_type: str = "linear",
         halve_model_size: bool = False,
@@ -382,6 +386,7 @@ class G(nn.Module):
         mix_hard_cases_max_angle: float = 89.0,
     ):
         super().__init__()
+        use_modulation = num_classes > 0 or cond_dim > 0
 
         self.encoder = Transformer(
             input_size=input_size,
@@ -390,6 +395,7 @@ class G(nn.Module):
             model_type="encoder",
             token_chns=token_channels,
             num_classes=num_classes,
+            use_modulation=use_modulation,
             in_context_size=in_context_size,
             halve_model_size=halve_model_size,
             latent_mlp_mixer_depth=vit_enc_latent_mlp_mixer_depth,
@@ -403,6 +409,7 @@ class G(nn.Module):
             model_type="decoder",
             token_chns=token_channels,
             num_classes=num_classes,
+            use_modulation=use_modulation,
             in_context_size=in_context_size,
             halve_model_size=halve_model_size,
             latent_mlp_mixer_depth=vit_dec_latent_mlp_mixer_depth,
@@ -412,8 +419,20 @@ class G(nn.Module):
         )
 
         self.num_classes = num_classes
+        self.cond_dim = cond_dim
+        self.use_cond_embed = cond_dim > 0
         self.latent_shape = self.decoder.latent_shape  # [1, N, D]
         self.use_modulation = self.encoder.use_modulation or self.decoder.use_modulation
+        self.encoder_cond_proj = (
+            nn.Linear(cond_dim, self.encoder.hidden_size)
+            if self.use_cond_embed
+            else None
+        )
+        self.decoder_cond_proj = (
+            nn.Linear(cond_dim, self.decoder.hidden_size)
+            if self.use_cond_embed
+            else None
+        )
 
         # spherify fn
         self.f = partial(vector_rms_norm, zero_mean=False)
@@ -429,15 +448,49 @@ class G(nn.Module):
 
         self.log_dict = {}
 
+    def _normalize_cond_embed(self, cond_embed):
+        if cond_embed is None:
+            return None
+        if cond_embed.ndim == 2:
+            return cond_embed.unsqueeze(1)
+        if cond_embed.ndim == 3:
+            return cond_embed
+        raise ValueError(f"cond_embed must be rank 2 or 3, got {cond_embed.shape}")
+
+    def _project_cond_embed(self, cond_embed, proj, name):
+        if cond_embed is None:
+            return None
+        if proj is None:
+            raise ValueError(f"{name} received cond_embed but this model was not built with cond_dim")
+        cond_embed = self._normalize_cond_embed(cond_embed)
+        return proj(cond_embed)
+
+    def _prepare_cond_pair(self, cond_embed, cond_embed_uncond=None, use_cfg=False):
+        if cond_embed is None:
+            return (None, None), (None, None)
+
+        if cond_embed_uncond is None and use_cfg:
+            cond_embed_uncond = torch.zeros_like(cond_embed)
+
+        cond_enc = self._project_cond_embed(cond_embed, self.encoder_cond_proj, "encoder")
+        cond_dec = self._project_cond_embed(cond_embed, self.decoder_cond_proj, "decoder")
+        if not use_cfg:
+            return (cond_enc, cond_dec), (None, None)
+
+        uncond_enc = self._project_cond_embed(cond_embed_uncond, self.encoder_cond_proj, "encoder")
+        uncond_dec = self._project_cond_embed(cond_embed_uncond, self.decoder_cond_proj, "decoder")
+        return (cond_enc, cond_dec), (uncond_enc, uncond_dec)
+
     """
     functions for training
     """
 
-    def forward(self, x, y=None):
+    def forward(self, x, y=None, cond_embed=None):
         extra_loss = {}
+        (y_enc_embed, y_dec_embed), _ = self._prepare_cond_pair(cond_embed)
 
         # encode
-        z = self.encoder(x, y)  # [B, N, D]
+        z = self.encoder(x, y, cond_embed=y_enc_embed)  # [B, N, D]
         z_clean = z.clone().detach()  # target for latent consistency loss
 
         # log stats
@@ -493,13 +546,18 @@ class G(nn.Module):
 
             # concat
             z = torch.cat([z_NOISY, z_noisy], dim=0)  # [B x 2, ...]
-            y = torch.cat([y, y], dim=0)  # [B x 2, ...]
+            if y is not None:
+                y = torch.cat([y, y], dim=0)  # [B x 2, ...]
+            if y_enc_embed is not None:
+                y_enc_embed = torch.cat([y_enc_embed, y_enc_embed], dim=0)
+            if y_dec_embed is not None:
+                y_dec_embed = torch.cat([y_dec_embed, y_dec_embed], dim=0)
 
         else:
             z = z_NOISY
 
         # decode
-        x = self.decoder(z, y, log_dict=self.log_dict)  # [B, 3, H, W]
+        x = self.decoder(z, y, log_dict=self.log_dict, cond_embed=y_dec_embed)  # [B, 3, H, W]
 
         # latent consistency part
         v_NOISY = None
@@ -507,7 +565,9 @@ class G(nn.Module):
             B = z_clean.shape[0]
 
             x_NOISY = x[:B]  # fake images from z_NOISY
-            v_NOISY = self.encoder(x_NOISY, y[:B])
+            y_lat = y[:B] if y is not None else None
+            y_enc_lat = y_enc_embed[:B] if y_enc_embed is not None else None
+            v_NOISY = self.encoder(x_NOISY, y_lat, cond_embed=y_enc_lat)
 
         return x, extra_loss, v_NOISY, z_clean
 
@@ -534,13 +594,14 @@ class G(nn.Module):
         return z
 
     @torch.no_grad()
-    def reconstruct(self, x, y=None, noise_scaler=1.0, sampling=False):
-        if self.num_classes > 0 and y is None:
+    def reconstruct(self, x, y=None, noise_scaler=1.0, sampling=False, cond_embed=None):
+        if cond_embed is None and self.num_classes > 0 and y is None:
             y = torch.full((x.shape[0],), self.num_classes)
             y = y.to(device=x.device, dtype=torch.long)  # null class embedding
-        z = self.encoder(x, y)
+        (y_enc_embed, y_dec_embed), _ = self._prepare_cond_pair(cond_embed)
+        z = self.encoder(x, y, cond_embed=y_enc_embed)
         z = self.spherify(z, noise_scaler=noise_scaler, sampling=sampling)
-        x = self.decoder(z, y)
+        x = self.decoder(z, y, cond_embed=y_dec_embed)
         x = torch.clamp(x * 0.5 + 0.5, 0, 1)
         return x
 
@@ -549,6 +610,8 @@ class G(nn.Module):
         self,
         batch_size,
         y=None,
+        cond_embed=None,
+        cond_embed_uncond=None,
         cfg=1.0,
         cfg_position="combo",
         forward_steps=1,
@@ -568,7 +631,17 @@ class G(nn.Module):
 
         e = torch.randn(batch_size, *self.latent_shape[1:]).to(device)
 
-        if self.num_classes > 0:
+        (cond_pair, uncond_pair) = self._prepare_cond_pair(
+            cond_embed,
+            cond_embed_uncond=cond_embed_uncond,
+            use_cfg=use_cfg,
+        )
+        y_enc_embed, y_dec_embed = cond_pair
+        y_enc_embed_uncond, y_dec_embed_uncond = uncond_pair
+
+        if cond_embed is not None:
+            y, y_uncond = None, None
+        elif self.num_classes > 0:
             if y is None:
                 y = torch.randint(
                     low=0,
@@ -582,10 +655,10 @@ class G(nn.Module):
             y, y_uncond = None, None
 
         z = self.spherify(e, sampling=False)
-        x = self.decoder(z, y)
+        x = self.decoder(z, y, cond_embed=y_dec_embed)
 
         if do_dec_cfg:
-            x_uncond = self.decoder(z, y_uncond)
+            x_uncond = self.decoder(z, y_uncond, cond_embed=y_dec_embed_uncond)
             x = torch.lerp(x_uncond, x, cfg).clamp_(-1, 1)
 
         h = x.clone()
@@ -595,9 +668,9 @@ class G(nn.Module):
             return h, h
 
         for step in range(forward_steps - 1):
-            z = self.encoder(x, y)
+            z = self.encoder(x, y, cond_embed=y_enc_embed)
             if do_enc_cfg:
-                z_uncond = self.encoder(x, y_uncond)
+                z_uncond = self.encoder(x, y_uncond, cond_embed=y_enc_embed_uncond)
                 z = torch.lerp(z_uncond, z, cfg)
 
             if use_sampling_scheduler:
@@ -610,10 +683,10 @@ class G(nn.Module):
             z = self.spherify(
                 z, sampling=True, noise_scaler=r, cache_noise=cache_sampling_noise
             )
-            x = self.decoder(z, y)
+            x = self.decoder(z, y, cond_embed=y_dec_embed)
 
             if do_dec_cfg:
-                x_uncond = self.decoder(z, y_uncond)
+                x_uncond = self.decoder(z, y_uncond, cond_embed=y_dec_embed_uncond)
                 x = torch.lerp(x_uncond, x, cfg).clamp_(-1, 1)
 
         x = torch.clamp(x * 0.5 + 0.5, 0, 1)
